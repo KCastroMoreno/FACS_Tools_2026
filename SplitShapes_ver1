@@ -40,7 +40,7 @@ def do_split(neutral, shape, pos_a, pos_b, blend_width, suf_a, suf_b):
     pts_s = fn_s.getPoints(om.MSpace.kObject)
 
     if len(pts_n) != len(pts_s):
-        raise RuntimeError(f"Vertex count mismatch: {shape} vs neutral.")
+        raise RuntimeError("Vertex count mismatch: " + shape + " vs neutral.")
 
     deltas = [pts_s[i] - pts_n[i] for i in range(len(pts_n))]
     pts_w  = fn_n.getPoints(om.MSpace.kWorld)
