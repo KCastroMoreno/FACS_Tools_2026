@@ -1,0 +1,355 @@
+"""
+Shape Splitter v6.0
+-------------------
+Pick vertex A on the region you WANT the shape to appear.
+Pick vertex B on the region you want NOTHING (zeroed out).
+Blend Width feathers the transition between them.
+
+Works for any split: L/R face, ear only, brow only, etc.
+"""
+
+import maya.cmds as cmds
+import maya.api.OpenMaya as om
+
+state = {"pos_a": None, "pos_b": None, "ui": {}, "batch_shapes": []}
+WIN   = "shapeSplitterV6"
+
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+
+def get_fn(name):
+    sel = om.MSelectionList()
+    sel.add(name)
+    dag = sel.getDagPath(0)
+    return dag, om.MFnMesh(dag)
+
+
+def vtx_world_pos(vtx_str):
+    sel = om.MSelectionList()
+    sel.add(vtx_str)
+    dag, comp = sel.getComponent(0)
+    it = om.MItMeshVertex(dag, comp)
+    return it.position(om.MSpace.kWorld)
+
+
+def compute_weights(neutral_name, pos_a, pos_b, blend_width):
+    """
+    Per-vertex weight toward A (1.0 = full shape, 0.0 = zeroed).
+    pos_a = region that gets the shape
+    pos_b = region that gets nothing
+    """
+    _, fn_n = get_fn(neutral_name)
+    pts_w   = fn_n.getPoints(om.MSpace.kWorld)
+
+    ab   = om.MVector(pos_a - pos_b)
+    dist = ab.length()
+    mid  = om.MPoint(
+        (pos_a.x + pos_b.x) * 0.5,
+        (pos_a.y + pos_b.y) * 0.5,
+        (pos_a.z + pos_b.z) * 0.5,
+    )
+    axis = ab.normalize() if dist > 1e-5 else om.MVector(1, 0, 0)
+    half = max(blend_width * 0.5, 1e-6)
+
+    weights = []
+    for pt in pts_w:
+        proj = om.MVector(pt - mid) * axis   # + = toward A, - = toward B
+        t    = max(0.0, min(1.0, (proj + half) / (2.0 * half)))
+        t    = t * t * (3.0 - 2.0 * t)      # smooth-step
+        weights.append(t)
+
+    return weights, fn_n.getPoints(om.MSpace.kObject)
+
+
+def do_split(neutral, shape, pos_a, pos_b, blend_width, suf_a, suf_b):
+    _, fn_s = get_fn(shape)
+    _, fn_n = get_fn(neutral)
+    pts_n   = fn_n.getPoints(om.MSpace.kObject)
+    pts_s   = fn_s.getPoints(om.MSpace.kObject)
+
+    if len(pts_n) != len(pts_s):
+        raise RuntimeError("Vertex count mismatch: " + shape + " vs neutral.")
+
+    deltas          = [pts_s[i] - pts_n[i] for i in range(len(pts_n))]
+    weights, pts_n2 = compute_weights(neutral, pos_a, pos_b, blend_width)
+
+    results = []
+    # A output: vertices toward A get full delta, toward B get zero
+    # B output: inverse — toward B gets full delta, toward A gets zero
+    for side, suffix in (("a", suf_a), ("b", suf_b)):
+        dup = cmds.duplicate(neutral, name=shape + suffix)[0]
+        _, fn_d = get_fn(dup)
+        pts_d   = fn_d.getPoints(om.MSpace.kObject)
+
+        for i in range(len(pts_n)):
+            w = weights[i] if side == "a" else 1.0 - weights[i]
+            d, p      = deltas[i], pts_n[i]
+            pts_d[i]  = om.MPoint(p.x + d.x*w, p.y + d.y*w, p.z + d.z*w)
+
+        fn_d.setPoints(pts_d, om.MSpace.kObject)
+        results.append(dup)
+
+    return results
+
+
+def get_meshes_in_group(grp):
+    children = cmds.listRelatives(grp, children=True, type="transform", fullPath=False) or []
+    meshes = []
+    for child in children:
+        shapes = cmds.listRelatives(child, shapes=True, type="mesh") or []
+        if shapes:
+            meshes.append(child)
+    return meshes
+
+
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def status(msg):
+    if state["ui"].get("status"):
+        cmds.text(state["ui"]["status"], e=True, label="  " + msg)
+
+
+def pick_vtx(slot):
+    sel   = cmds.ls(sl=True, flatten=True)
+    verts = [s for s in sel if ".vtx[" in s]
+    if not verts:
+        status("  Switch to vertex mode (F8) and click a vertex.")
+        return
+    vtx = verts[0]
+    pos = vtx_world_pos(vtx)
+    state["pos_" + slot] = pos
+    cmds.button(state["ui"]["btn_" + slot], e=True, backgroundColor=(0.22, 0.55, 0.35))
+    cmds.text(
+        state["ui"]["lbl_" + slot], e=True,
+        label="  %s   (%.2f, %.2f, %.2f)" % (vtx, pos.x, pos.y, pos.z)
+    )
+    status("Vertex " + slot.upper() + " set  OK")
+
+
+def clear_vtx(slot):
+    state["pos_" + slot] = None
+    cmds.button(state["ui"]["btn_" + slot], e=True, backgroundColor=(0.32, 0.32, 0.32))
+    cmds.text(state["ui"]["lbl_" + slot], e=True, label="  --")
+    status("Vertex " + slot.upper() + " cleared.")
+
+
+def fill_mesh(key):
+    sel = cmds.ls(sl=True, long=False, transforms=True)
+    if sel:
+        cmds.textField(state["ui"][key], e=True, text=sel[0])
+
+
+def fill_group(*_):
+    sel = cmds.ls(sl=True, long=False, transforms=True)
+    if not sel:
+        status("  Select a group first."); return
+    grp    = sel[0]
+    meshes = get_meshes_in_group(grp)
+    if not meshes:
+        status("  No meshes found directly inside: " + grp); return
+    state["batch_shapes"] = meshes
+    cmds.textField(state["ui"]["grp_field"], e=True, text=grp)
+    _refresh_list(meshes)
+    status("  %d shapes loaded from: %s" % (len(meshes), grp))
+
+
+def clear_group(*_):
+    state["batch_shapes"] = []
+    cmds.textField(state["ui"]["grp_field"], e=True, text="")
+    cmds.textScrollList(state["ui"]["shape_list"], e=True, removeAll=True)
+    status("  Batch list cleared.")
+
+
+def _refresh_list(meshes):
+    lst = state["ui"]["shape_list"]
+    cmds.textScrollList(lst, e=True, removeAll=True)
+    for m in meshes:
+        cmds.textScrollList(lst, e=True, append=m)
+
+
+# ── Split runners ──────────────────────────────────────────────────────────────
+
+def _common_params():
+    ui          = state["ui"]
+    neutral     = cmds.textField(ui["neutral"], q=True, text=True).strip()
+    blend_width = cmds.floatSliderGrp(ui["blend"], q=True, value=True)
+    suf_a       = cmds.textField(ui["suf_a"], q=True, text=True).strip() or "_A"
+    suf_b       = cmds.textField(ui["suf_b"], q=True, text=True).strip() or "_B"
+    return neutral, blend_width, suf_a, suf_b
+
+
+def _validate_common(neutral):
+    if not neutral or not cmds.objExists(neutral):
+        status("  Set a valid Neutral mesh."); return False
+    if state["pos_a"] is None:
+        status("  Pick vertex A first."); return False
+    if state["pos_b"] is None:
+        status("  Pick vertex B first."); return False
+    return True
+
+
+def run_single(*_):
+    neutral, blend_width, suf_a, suf_b = _common_params()
+    shape = cmds.textField(state["ui"]["shape"], q=True, text=True).strip()
+    if not _validate_common(neutral): return
+    if not shape or not cmds.objExists(shape):
+        status("  Set a valid Shape mesh."); return
+    try:
+        out = do_split(neutral, shape, state["pos_a"], state["pos_b"],
+                       blend_width, suf_a, suf_b)
+        cmds.select(out)
+        status("  Done:  " + out[0] + "   |   " + out[1])
+    except Exception as e:
+        status("  Error: " + str(e)); raise
+
+
+def run_batch(*_):
+    neutral, blend_width, suf_a, suf_b = _common_params()
+    shapes = state["batch_shapes"]
+    if not _validate_common(neutral): return
+    if not shapes:
+        status("  Load a group first."); return
+
+    done, failed = [], []
+    for shape in shapes:
+        if not cmds.objExists(shape):
+            failed.append(shape + " (not found)")
+            continue
+        try:
+            do_split(neutral, shape, state["pos_a"], state["pos_b"],
+                     blend_width, suf_a, suf_b)
+            done.append(shape)
+        except Exception as e:
+            failed.append(shape + " (" + str(e) + ")")
+
+    msg = "  %d shapes split" % len(done)
+    if failed:
+        msg += "   |   %d failed: %s" % (len(failed), ", ".join(failed))
+    status(msg)
+
+
+# ── Build UI ──────────────────────────────────────────────────────────────────
+
+def build_ui():
+    if cmds.window(WIN, exists=True):
+        cmds.deleteUI(WIN)
+
+    cmds.window(WIN, title="Shape Splitter", widthHeight=(430, 540), sizeable=True)
+    ui = state["ui"]
+
+    cmds.columnLayout(adj=True, rs=5, co=["both", 12])
+    cmds.separator(h=8, style="none")
+    cmds.text(label="Shape Splitter", font="boldLabelFont", align="left")
+    cmds.separator(h=2)
+
+    # ── Neutral
+    cmds.rowLayout(nc=3, cw3=(68, 224, 66), adj=2)
+    cmds.text(label="Neutral", align="right", w=68)
+    ui["neutral"] = cmds.textField(pht="select neutral mesh, then << Sel")
+    cmds.button(label="<< Sel", w=64, c=lambda _: fill_mesh("neutral"))
+    cmds.setParent("..")
+
+    cmds.separator(h=6)
+
+    # ── Vertex pickers
+    cmds.text(label="A = region that gets the shape   |   B = region that gets nothing",
+              font="boldLabelFont", align="left")
+    cmds.text(label="  e.g. A on ear, B on chin  →  only the ear area gets the shape",
+              font="smallPlainLabelFont", align="left")
+    cmds.separator(h=2)
+
+    for slot, label in (("a", "A  ( shape region )"), ("b", "B  ( zero region )")):
+        cmds.rowLayout(nc=3, cw3=(140, 36, 210), adj=3)
+        ui["btn_" + slot] = cmds.button(
+            label="  Pick vertex " + label, w=138, h=26,
+            backgroundColor=(0.32, 0.32, 0.32),
+            c=lambda _, s=slot: pick_vtx(s),
+        )
+        cmds.button(
+            label="X", w=24, h=26,
+            backgroundColor=(0.45, 0.22, 0.22),
+            c=lambda _, s=slot: clear_vtx(s),
+        )
+        ui["lbl_" + slot] = cmds.text(label="  --", font="smallPlainLabelFont", align="left")
+        cmds.setParent("..")
+
+    cmds.separator(h=6)
+
+    # ── Blend Width
+    cmds.text(label="Blend Width  ( scene units )", font="boldLabelFont", align="left")
+    cmds.text(label="  0 = hard cut     increase to feather the transition",
+              font="smallPlainLabelFont", align="left")
+    ui["blend"] = cmds.floatSliderGrp(
+        label="Width  ", field=True,
+        value=2.0, min=0.0, max=20.0, fmn=0.0, fmx=200.0,
+        pre=2, s=0.1, cw3=(52, 52, 278),
+    )
+
+    cmds.separator(h=4)
+
+    # ── Suffixes
+    cmds.rowLayout(nc=4, cw4=(68, 78, 48, 78), adj=2)
+    cmds.text(label="A suffix", align="right", w=68)
+    ui["suf_a"] = cmds.textField(text="_L", w=76)
+    cmds.text(label="  B suffix", align="right", w=46)
+    ui["suf_b"] = cmds.textField(text="_R", w=76)
+    cmds.setParent("..")
+
+    cmds.separator(h=6)
+
+    # ── Tabs
+    tabs = cmds.tabLayout(innerMarginWidth=8, innerMarginHeight=8)
+
+    # Single tab
+    single_col = cmds.columnLayout(adj=True, rs=4)
+    cmds.separator(h=4, style="none")
+    cmds.text(label="Split a single shape mesh.", font="smallPlainLabelFont", align="left")
+    cmds.rowLayout(nc=3, cw3=(68, 210, 66), adj=2)
+    cmds.text(label="Shape", align="right", w=68)
+    ui["shape"] = cmds.textField(pht="select shape mesh, then << Sel")
+    cmds.button(label="<< Sel", w=64, c=lambda _: fill_mesh("shape"))
+    cmds.setParent("..")
+    cmds.separator(h=4)
+    cmds.button(label="Split  ->  A | B", h=32,
+                backgroundColor=(0.22, 0.55, 0.35), c=run_single)
+    cmds.separator(h=4, style="none")
+    cmds.setParent("..")
+    cmds.setParent("..")
+
+    # Batch tab
+    batch_col = cmds.columnLayout(adj=True, rs=4, parent=tabs)
+    cmds.separator(h=4, style="none")
+    cmds.text(label="Select a group containing all your shape meshes.",
+              font="smallPlainLabelFont", align="left")
+    cmds.rowLayout(nc=3, cw3=(68, 190, 66), adj=2)
+    cmds.text(label="Group", align="right", w=68)
+    ui["grp_field"] = cmds.textField(pht="select group, then << Sel")
+    cmds.button(label="<< Sel", w=64, c=fill_group)
+    cmds.setParent("..")
+    cmds.separator(h=2)
+    cmds.text(label="Shapes in group:", font="smallPlainLabelFont", align="left")
+    ui["shape_list"] = cmds.textScrollList(h=110, allowMultiSelection=False)
+    # Clear list button
+    cmds.button(
+        label="Clear List", h=24,
+        backgroundColor=(0.38, 0.28, 0.28),
+        c=clear_group,
+    )
+    cmds.separator(h=4)
+    cmds.button(label="Split All  ->  A | B", h=32,
+                backgroundColor=(0.22, 0.55, 0.35), c=run_batch)
+    cmds.separator(h=4, style="none")
+    cmds.setParent("..")
+    cmds.setParent("..")
+
+    cmds.tabLayout(tabs, e=True,
+                   tabLabel=((single_col, "  Single  "), (batch_col, "  Batch  ")))
+
+    cmds.separator(h=4)
+    ui["status"] = cmds.text(label="", align="left", font="smallPlainLabelFont")
+    cmds.separator(h=8, style="none")
+
+    cmds.showWindow(WIN)
+
+
+build_ui()
